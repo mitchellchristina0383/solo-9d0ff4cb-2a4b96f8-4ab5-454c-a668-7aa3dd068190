@@ -39,6 +39,17 @@ class RootCause(BaseModel):
 class ActionableFault(BaseModel):
     service: str
     last_seq: int
+    phase: int = Field(
+        ...,
+        description=(
+            "Monotonically increasing identifier of the service's current "
+            "actionable-alert phase; submit it to /acknowledgements"
+        ),
+    )
+    acknowledged: bool = Field(
+        ..., description="Whether the current phase has been acknowledged"
+    )
+    acknowledged_at: Optional[str] = None
 
 
 class SuppressedFault(BaseModel):
@@ -83,3 +94,22 @@ class ReplaceResponse(BaseModel):
     service_count: int
     edge_count: int
     preserved_state: list[str]
+
+
+class AcknowledgementPayload(BaseModel):
+    service: str = Field(..., min_length=1)
+    phase: int = Field(
+        ...,
+        ge=1,
+        description="Phase identifier read from /alerts actionable_faults[].phase",
+    )
+
+
+class AcknowledgementResponse(BaseModel):
+    acknowledged: bool
+    duplicate: bool = Field(
+        ..., description="True when this phase had already been acknowledged"
+    )
+    service: str
+    phase: int
+    acknowledged_at: str

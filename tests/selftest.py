@@ -454,6 +454,421 @@ def test_concurrency() -> None:
     )
 
 
+def test_phase_acknowledgement_basics() -> None:
+    print("[T6] alert phases and acknowledgement basics")
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+
+    status, alerts = request("GET", "/alerts")
+    d = next(f for f in alerts["actionable_faults"] if f["service"] == "D")
+    check("actionable fault exposes phase 1", d["phase"] == 1, str(d))
+    check("new phase starts unacknowledged", d["acknowledged"] is False
+          and d["acknowledged_at"] is None, str(d))
+
+    status, body = request("POST", "/acknowledgements", {"service": "D", "phase": 1})
+    check("acknowledge current phase accepted",
+          status == 200 and body["acknowledged"] is True
+          and body["duplicate"] is False and body["phase"] == 1, str(body))
+    first_ack_at = body.get("acknowledged_at")
+    check("acknowledgement returns a timestamp",
+          isinstance(first_ack_at, str) and first_ack_at, str(body))
+
+    status, body = request("POST", "/acknowledgements", {"service": "D", "phase": 1})
+    check("re-acknowledging current phase is idempotent",
+          status == 200 and body["duplicate"] is True
+          and body["acknowledged_at"] == first_ack_at, str(body))
+
+    _, alerts = request("GET", "/alerts")
+    d = next(f for f in alerts["actionable_faults"] if f["service"] == "D")
+    check("alerts reflect the acknowledgement",
+          d["acknowledged"] is True and d["acknowledged_at"] == first_ack_at, str(d))
+
+    status, body = request("POST", "/acknowledgements", {"service": "D", "phase": 2})
+    check("future/unknown phase rejected 409 stale_phase",
+          status == 409 and body["error"] == "stale_phase", str(body))
+
+    status, body = request("POST", "/acknowledgements", {"service": "NOPE", "phase": 1})
+    check("acknowledging unknown service -> 404",
+          status == 404 and body["error"] == "unknown_service", str(body))
+
+    status, body = request("POST", "/acknowledgements", {"service": "D", "phase": 0})
+    check("phase <= 0 -> 422", status == 422, str(body))
+
+    status, body = request("POST", "/acknowledgements", {"service": "B", "phase": 1})
+    check("healthy/unreported service has no actionable phase -> 409",
+          status == 409 and body["error"] == "stale_phase", str(body))
+
+    # A suppressed fault is not actionable, so it cannot be acknowledged either.
+    request("POST", "/reports", {"service": "B", "seq": 1, "status": "fault"})
+    _, alerts = request("GET", "/alerts")
+    check("B is now suppressed by D",
+          any(f["service"] == "B" for f in alerts["suppressed_faults"]), str(alerts))
+    status, body = request("POST", "/acknowledgements", {"service": "B", "phase": 1})
+    check("suppressed fault cannot be acknowledged -> 409",
+          status == 409 and body["error"] == "stale_phase", str(body))
+
+    # Retries that do not change classification must not clear the ack.
+    status, body = request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+    check("same-seq retry stays idempotent", body["duplicate"] is True, str(body))
+    _, alerts = request("GET", "/alerts")
+    d = next(f for f in alerts["actionable_faults"] if f["service"] == "D")
+    check("idempotent retry keeps phase and acknowledgement",
+          d["phase"] == 1 and d["acknowledged"] is True, str(d))
+
+    status, body = request("POST", "/reports", {"service": "D", "seq": 2, "status": "fault"})
+    check("repeated fault with higher seq applies",
+          body["applied"] is True and body["current_status"] == "down", str(body))
+    _, alerts = request("GET", "/alerts")
+    d = next(f for f in alerts["actionable_faults"] if f["service"] == "D")
+    check("still-actionable service keeps its phase after an applied fault report",
+          d["phase"] == 1 and d["acknowledged"] is True, str(d))
+
+
+def test_phase_transitions() -> None:
+    print("[T7] phase transitions: recovery, suppression, graph swaps")
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+
+    # Recovery then a new fault starts a fresh phase.
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+    request("POST", "/acknowledgements", {"service": "D", "phase": 1})
+    request("POST", "/reports", {"service": "D", "seq": 2, "status": "recover"})
+    request("POST", "/reports", {"service": "D", "seq": 3, "status": "fault"})
+    _, alerts = request("GET", "/alerts")
+    d = next(f for f in alerts["actionable_faults"] if f["service"] == "D")
+    check("fault after recovery gets a new phase", d["phase"] == 2, str(d))
+    check("new phase is unacknowledged", d["acknowledged"] is False, str(d))
+    status, body = request("POST", "/acknowledgements", {"service": "D", "phase": 1})
+    check("old phase ack rejected after recovery/re-fault",
+          status == 409 and body["error"] == "stale_phase", str(body))
+    status, body = request("POST", "/acknowledgements", {"service": "D", "phase": 2})
+    check("new phase ack accepted", status == 200 and body["duplicate"] is False, str(body))
+
+    # Suppression by a new upstream fault ends the phase; when the upstream
+    # recovers the still-faulty downstream must get a new phase.
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    request("POST", "/reports", {"service": "A", "seq": 1, "status": "fault"})
+    request("POST", "/acknowledgements", {"service": "A", "phase": 1})
+    request("POST", "/reports", {"service": "B", "seq": 1, "status": "fault"})
+    _, alerts = request("GET", "/alerts")
+    check("A becomes suppressed by upstream B",
+          any(f["service"] == "A" for f in alerts["suppressed_faults"]), str(alerts))
+    status, body = request("POST", "/acknowledgements", {"service": "A", "phase": 1})
+    check("acknowledgement cannot attach to a suppressed alert",
+          status == 409 and body["error"] == "stale_phase", str(body))
+    status, body = request("POST", "/acknowledgements", {"service": "B", "phase": 1})
+    check("upstream root B is acknowledgeable", status == 200, str(body))
+
+    request("POST", "/reports", {"service": "B", "seq": 2, "status": "recover"})
+    _, alerts = request("GET", "/alerts")
+    a = next(f for f in alerts["actionable_faults"] if f["service"] == "A")
+    check("still-faulty A re-enters actionable with a new phase", a["phase"] == 2, str(a))
+    check("the new phase is unacknowledged", a["acknowledged"] is False, str(a))
+    status, body = request("POST", "/acknowledgements", {"service": "A", "phase": 1})
+    check("pre-suppression acknowledgement is stale",
+          status == 409 and body["error"] == "stale_phase", str(body))
+    status, body = request("POST", "/acknowledgements", {"service": "A", "phase": 2})
+    check("re-entered phase is acknowledgeable", status == 200, str(body))
+
+    # Graph swaps that leave classification unchanged preserve phase and ack.
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+    request("POST", "/reports", {"service": "B", "seq": 1, "status": "fault"})
+    request("POST", "/acknowledgements", {"service": "D", "phase": 1})
+    status, body = request("POST", "/graph", GRAPH_V2)
+    check("same-classification swap accepted", status == 200, str(body))
+    _, alerts = request("GET", "/alerts")
+    d = next(f for f in alerts["actionable_faults"] if f["service"] == "D")
+    check("classification-unchanged swap keeps phase 1", d["phase"] == 1, str(d))
+    check("classification-unchanged swap keeps the acknowledgement",
+          d["acknowledged"] is True, str(d))
+    status, body = request("POST", "/acknowledgements", {"service": "D", "phase": 1})
+    check("ack still valid after classification-unchanged swap",
+          status == 200, str(body))
+
+    # A graph swap that removes the suppressing upstream makes the downstream
+    # actionable again with a fresh phase; swapping back suppresses it again.
+    # A had phase 1 while it was momentarily actionable (before B reported),
+    # so the post-swap episodes are phases 2 and 3.
+    reset()
+    request("POST", "/graph", {
+        "version": "chain",
+        "services": [
+            {"name": "A", "dependencies": ["B"]},
+            {"name": "B", "dependencies": []},
+        ],
+    })
+    request("POST", "/reports", {"service": "A", "seq": 1, "status": "fault"})
+    request("POST", "/reports", {"service": "B", "seq": 1, "status": "fault"})
+    _, alerts = request("GET", "/alerts")
+    check("A suppressed by B before the swap",
+          any(f["service"] == "A" for f in alerts["suppressed_faults"]), str(alerts))
+    status, _ = request("POST", "/graph", {
+        "version": "flat",
+        "services": [
+            {"name": "A", "dependencies": []},
+            {"name": "B", "dependencies": []},
+        ],
+    })
+    check("edge-removing swap accepted", status == 200)
+    _, alerts = request("GET", "/alerts")
+    a = next(f for f in alerts["actionable_faults"] if f["service"] == "A")
+    check("swap-cut suppression gives A a fresh phase", a["phase"] == 2, str(a))
+    status, body = request("POST", "/acknowledgements", {"service": "A", "phase": 2})
+    check("freshly actionable A is acknowledgeable after swap", status == 200, str(body))
+    request("POST", "/graph", {
+        "version": "chain2",
+        "services": [
+            {"name": "A", "dependencies": ["B"]},
+            {"name": "B", "dependencies": []},
+        ],
+    })
+    _, alerts = request("GET", "/alerts")
+    check("A is suppressed again after the edge returns",
+          any(f["service"] == "A" for f in alerts["suppressed_faults"]), str(alerts))
+    request("POST", "/graph", {
+        "version": "flat2",
+        "services": [
+            {"name": "A", "dependencies": []},
+            {"name": "B", "dependencies": []},
+        ],
+    })
+    _, alerts = request("GET", "/alerts")
+    a = next(f for f in alerts["actionable_faults"] if f["service"] == "A")
+    check("A gets yet another phase after swap-cycle", a["phase"] == 3, str(a))
+    check("the newest phase is unacknowledged", a["acknowledged"] is False, str(a))
+    status, body = request("POST", "/acknowledgements", {"service": "A", "phase": 2})
+    check("ack from the previous swap episode is stale",
+          status == 409 and body["error"] == "stale_phase", str(body))
+    status, body = request("POST", "/acknowledgements", {"service": "A", "phase": 3})
+    check("ack for the newest swap episode is accepted", status == 200, str(body))
+
+    # Removing the service from the graph and re-adding it also starts a new
+    # phase if it is still faulty and actionable when it comes back.
+    reset()
+    request("POST", "/graph", {
+        "services": [{"name": "A", "dependencies": []}],
+    })
+    request("POST", "/reports", {"service": "A", "seq": 1, "status": "fault"})
+    request("POST", "/acknowledgements", {"service": "A", "phase": 1})
+    request("POST", "/graph", {"services": [{"name": "Z", "dependencies": []}]})
+    _, alerts = request("GET", "/alerts")
+    check("removed service disappears from alerts", alerts["services"] == ["Z"], str(alerts))
+    status, body = request("POST", "/acknowledgements", {"service": "A", "phase": 1})
+    check("removed service cannot be acknowledged -> 404",
+          status == 404 and body["error"] == "unknown_service", str(body))
+    request("POST", "/graph", {"services": [{"name": "A", "dependencies": []}]})
+    _, alerts = request("GET", "/alerts")
+    a = next(f for f in alerts["actionable_faults"] if f["service"] == "A")
+    check("re-added still-faulty A gets a new phase", a["phase"] == 2, str(a))
+    check("re-added A is unacknowledged", a["acknowledged"] is False, str(a))
+
+
+def test_phase_concurrency() -> None:
+    print("[T8] concurrent acknowledgement/report/graph interleavings")
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+
+    # 8a: identical concurrent acknowledgements: exactly one first ack.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = [
+            pool.submit(request, "POST", "/acknowledgements",
+                        {"service": "D", "phase": 1})
+            for _ in range(8)
+        ]
+        acks = [f.result() for f in futs]
+    ok = [b for st, b in acks if st == 200]
+    firsts = [b for b in ok if not b["duplicate"]]
+    check("concurrent identical acks: all accepted", len(ok) == 8, str(acks))
+    check("concurrent identical acks: exactly one non-duplicate",
+          len(firsts) == 1, str(acks))
+    check("concurrent identical acks share one timestamp",
+          len({b["acknowledged_at"] for b in ok}) == 1, str(acks))
+
+    # 8b: acknowledgement racing recovery.  It either commits before the
+    # recovery (200, possibly duplicate) or is stale afterwards (409) -- never
+    # a 500, and the final state has no actionable fault.
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        recover = pool.submit(request, "POST", "/reports",
+                              {"service": "D", "seq": 2, "status": "recover"})
+        acks_f = [pool.submit(request, "POST", "/acknowledgements",
+                              {"service": "D", "phase": 1}) for _ in range(4)]
+        recover_result = recover.result()
+        acks = [f.result() for f in acks_f]
+    check("racing recovery still applies", recover_result[0] == 200, str(recover_result))
+    check("racing acks return 200 or 409 stale_phase only",
+          all(st in (200, 409) for st, _ in acks)
+          and all(st == 200 or b["error"] == "stale_phase" for st, b in acks),
+          str(acks))
+    _, alerts = request("GET", "/alerts")
+    check("recovered D is not actionable", alerts["actionable_faults"] == [], str(alerts))
+    # Regardless of which acks won the race, a later fault is a new phase that
+    # must not inherit any of them.
+    request("POST", "/reports", {"service": "D", "seq": 3, "status": "fault"})
+    _, alerts = request("GET", "/alerts")
+    d = next(f for f in alerts["actionable_faults"] if f["service"] == "D")
+    check("re-fault after ack/recovery race is a new unacked phase",
+          d["phase"] == 2 and d["acknowledged"] is False, str(d))
+
+    # 8c: acknowledgement racing a report that suppresses the service.
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    request("POST", "/reports", {"service": "A", "seq": 1, "status": "fault"})
+    request("POST", "/acknowledgements", {"service": "A", "phase": 1})
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        fault_b = pool.submit(request, "POST", "/reports",
+                              {"service": "B", "seq": 1, "status": "fault"})
+        acks_f = [pool.submit(request, "POST", "/acknowledgements",
+                              {"service": "A", "phase": 1}) for _ in range(4)]
+        fault_b.result()
+        acks = [f.result() for f in acks_f]
+    check("ack racing a suppressing report: no unexpected status",
+          all(st in (200, 409) for st, _ in acks), str(acks))
+    _, alerts = request("GET", "/alerts")
+    check("A stays suppressed after the race",
+          any(f["service"] == "A" for f in alerts["suppressed_faults"]), str(alerts))
+    status, body = request("POST", "/acknowledgements", {"service": "A", "phase": 1})
+    check("post-race ack for suppressed A is stale",
+          status == 409 and body["error"] == "stale_phase", str(body))
+    # Upstream recovery re-opens A as a fresh, unacknowledged phase even though
+    # some acks won the earlier race.
+    request("POST", "/reports", {"service": "B", "seq": 2, "status": "recover"})
+    _, alerts = request("GET", "/alerts")
+    a = next(f for f in alerts["actionable_faults"] if f["service"] == "A")
+    check("after upstream recovery A has a new unacked phase",
+          a["phase"] == 2 and a["acknowledged"] is False, str(a))
+
+    # 8d: reports, acknowledgements and graph swaps all interleaved.  Every
+    # /alerts snapshot must be internally consistent and every ack must be
+    # either accepted for the phase it names or rejected as stale.
+    reset()
+    request("POST", "/graph", GRAPH_V1)
+    request("POST", "/reports", {"service": "D", "seq": 1, "status": "fault"})
+
+    def flip(i: int):
+        return request("POST", "/reports", {
+            "service": "D",
+            "seq": 100 + i,
+            "status": "fault" if i % 3 else "recover",
+        })
+
+    def swap(i: int):
+        return request("POST", "/graph", {**GRAPH_V2, "version": f"gen{i}"})
+
+    def read_and_ack(i: int):
+        status, body = request("GET", "/alerts")
+        if status != 200:
+            return body, None
+        phases = {f["service"]: f["phase"] for f in body["actionable_faults"]}
+        if "D" not in phases:
+            return body, None
+        ast, abody = request("POST", "/acknowledgements",
+                             {"service": "D", "phase": phases["D"]})
+        return body, (ast, abody, phases["D"])
+
+    # Guarantee at least one interleaved acknowledgement is exercised even if
+    # the first writer flips D to recover before any reader runs.
+    _, baseline = request("GET", "/alerts")
+    base_phase = next(
+        (f["phase"] for f in baseline["actionable_faults"] if f["service"] == "D"),
+        None,
+    )
+    if base_phase is not None:
+        ast, abody = request("POST", "/acknowledgements",
+                             {"service": "D", "phase": base_phase})
+        check("baseline acknowledgement before the interleaving succeeds",
+              ast == 200, str(abody))
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        reader_futs = [pool.submit(read_and_ack, i) for i in range(12)]
+        writer_futs = []
+        for i in range(12):
+            writer_futs.append(pool.submit(flip, i))
+            writer_futs.append(pool.submit(swap, i))
+        reads = [f.result() for f in reader_futs]
+        writes = [f.result() for f in writer_futs]
+
+    check("interleaved graph swaps all succeed",
+          all(st == 200 for st, _ in writes[1::2]), str(writes))
+    check("interleaved reports are applied or rejected as stale/conflicting only",
+          all(st in (200, 409) for st, _ in writes[0::2])
+          and all(st == 200 or b["error"] == "conflict" for st, b in writes[0::2]),
+          str(writes))
+
+    snapshots = [body for body, _ in reads]
+    consistent = True
+    for body in snapshots:
+        action = {f["service"] for f in body["actionable_faults"]}
+        supp = {f["service"] for f in body["suppressed_faults"]}
+        if action & supp or action | supp != set(body["down_services"]):
+            consistent = False
+        for fault in body["actionable_faults"]:
+            if not isinstance(fault.get("phase"), int) or fault["phase"] < 1:
+                consistent = False
+            if fault["acknowledged"] != (fault["acknowledged_at"] is not None):
+                consistent = False
+    check("every interleaved /alerts snapshot is consistent", consistent, str(snapshots[:2]))
+
+    # The reader may legitimately observe D as not-actionable (a concurrent
+    # flip recovered it), or observe a phase that another writer supersedes
+    # before the ack lands.  Either way, the only allowed outcomes are an ACK
+    # for that exact phase or a 409 stale_phase -- never an error or a silent
+    # acknowledgement of a different phase.
+    ack_attempts = [ack for _, ack in reads if ack is not None]
+    check("interleaved ack attempts return 200 or 409 stale_phase only",
+          all(st in (200, 409) for st, _, _ in ack_attempts)
+          and all(st == 200 or b["error"] == "stale_phase"
+                  for st, b, _ in ack_attempts),
+          str(ack_attempts))
+    check("at least one interleaved ack was exercised", ack_attempts != [], str(reads))
+
+    # Do one more read/ack after the storm so the path is exercised regardless
+    # of scheduling: with no concurrent writer, reading and then acknowledging
+    # the phase must succeed and be visible on that exact phase.
+    post_body, post_ack = read_and_ack(0)
+    if post_ack is not None:
+        pst, pb, pphase = post_ack
+        check("post-interleaving read-then-ack succeeds", pst == 200, str(pb))
+        _, after = request("GET", "/alerts")
+        cur = next(
+            (f for f in after["actionable_faults"] if f["service"] == "D"), None
+        )
+        check("post-interleaving ack is visible on the current phase",
+              cur is not None and cur["phase"] == pphase
+              and cur["acknowledged"] is True
+              and cur["acknowledged_at"] == pb["acknowledged_at"], str(cur))
+
+    # Every ack that succeeded must echo exactly the phase it was issued for.
+    check("successful acks echo the phase they acknowledged",
+          all(b["phase"] == phase for st, b, phase in ack_attempts if st == 200),
+          str(ack_attempts))
+
+    # Final invariant: every currently acknowledged phase was named by a
+    # successful ack for exactly that service and phase number -- no ack can
+    # ever be attributed to a phase it did not name.
+    _, alerts = request("GET", "/alerts")
+    all_acks = list(ack_attempts)
+    if post_ack is not None:
+        all_acks.append(post_ack)
+    for fault in alerts["actionable_faults"]:
+        if fault["acknowledged"]:
+            check(
+                f"acknowledged phase matches a successful ack for {fault['service']}",
+                any(st == 200 and body["service"] == fault["service"]
+                    and body["phase"] == fault["phase"]
+                    and body["acknowledged_at"] == fault["acknowledged_at"]
+                    for st, body, _ in all_acks),
+                str(fault) + " " + str(all_acks),
+            )
+
+
 def main() -> int:
     print(f"Self-test against {BASE_URL}\n")
     try:
@@ -467,6 +882,9 @@ def main() -> int:
     test_suppression()
     test_graph_replace_preserves_state()
     test_concurrency()
+    test_phase_acknowledgement_basics()
+    test_phase_transitions()
+    test_phase_concurrency()
 
     print(f"\n{'-' * 60}\nPASS={PASS} FAIL={FAIL}")
     if FAIL:

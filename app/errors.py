@@ -28,3 +28,10 @@ class NoGraph(Exception):
 
     status_code = 409
     code = "no_graph"
+
+
+class StalePhase(Exception):
+    """Acknowledgement refers to a phase that is no longer the current one."""
+
+    status_code = 409
+    code = "stale_phase"

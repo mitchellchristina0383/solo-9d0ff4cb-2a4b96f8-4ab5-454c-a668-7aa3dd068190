@@ -1,6 +1,7 @@
 """Fault/recovery report processing with per-service monotonic sequence numbers."""
 from __future__ import annotations
 
+from . import phase_service
 from .database import write_tx
 from .errors import ReportConflict, UnknownService
 from .schemas import ReportPayload
@@ -69,6 +70,13 @@ def submit_report(payload: ReportPayload) -> dict:
             "INSERT INTO events (service, seq, status, applied) VALUES (?, ?, ?, ?)",
             (payload.service, payload.seq, wanted, int(applied)),
         )
+
+        # Only an *applied* report can change classification.  An idempotent
+        # retry (same seq, same content) leaves the actionable set untouched,
+        # so it must not reset the phase or its acknowledgement.  Sync runs in
+        # this same transaction: if the write fails, nothing advances.
+        if applied:
+            phase_service.sync_alert_phases(conn)
 
     return {
         "applied": applied,

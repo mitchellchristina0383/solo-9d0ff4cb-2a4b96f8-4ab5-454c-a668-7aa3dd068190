@@ -1,11 +1,12 @@
 """Dependency-graph validation, replacement and fault classification."""
 from __future__ import annotations
 
-import sqlite3
 from collections import deque
 
+from . import phase_service
+from .classification import classify_snapshot, load_graph
 from .database import read_tx, write_tx
-from .errors import GraphError, NoGraph
+from .errors import GraphError
 from .schemas import GraphPayload, GraphResponse, ServiceIn
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,11 @@ def replace_graph(payload: GraphPayload) -> dict:
             "committed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
             (new_revision, payload.version),
         )
+        # The swap can change classification without any new report (e.g. a
+        # dropped upstream edge exposes a suppressed fault).  Phases are synced
+        # in this same transaction: a service that stays actionable keeps its
+        # phase and acknowledgement, a newly actionable one gets a fresh phase.
+        phase_service.sync_alert_phases(conn)
         preserved = [
             r["service"]
             for r in conn.execute(
@@ -150,24 +156,9 @@ def replace_graph(payload: GraphPayload) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _load_graph(conn: sqlite3.Connection) -> tuple[int, str | None, dict[str, list[str]]]:
-    meta = conn.execute("SELECT revision, version FROM graph_meta WHERE id = 1").fetchone()
-    if meta is None:
-        raise NoGraph("no dependency graph has been committed yet")
-    upstream: dict[str, list[str]] = {
-        r["service"]: [] for r in conn.execute("SELECT service FROM nodes")
-    }
-    for r in conn.execute(
-        "SELECT edges.upstream AS upstream, edges.downstream AS downstream "
-        "FROM edges ORDER BY edges.upstream, edges.downstream"
-    ):
-        upstream[r["downstream"]].append(r["upstream"])
-    return meta["revision"], meta["version"], upstream
-
-
 def get_graph() -> GraphResponse:
     with read_tx() as conn:
-        revision, version, upstream = _load_graph(conn)
+        revision, version, upstream = load_graph(conn)
         meta = conn.execute(
             "SELECT committed_at FROM graph_meta WHERE id = 1"
         ).fetchone()
@@ -189,89 +180,43 @@ def get_graph() -> GraphResponse:
 
 
 def classify_alerts() -> dict:
-    """Compute actionable vs suppressed faults from one committed snapshot.
+    """Return the alert classification plus each actionable alert's phase.
 
-    A faulty service is *suppressed* only when there exists a dependency path
-    on which **every** node is faulty leading to a root cause (a faulty
-    service with no faulty upstream).  Healthy or never-reported nodes cut
-    paths, so a fault behind such a node stays actionable.
+    Classification and phase rows are read from one committed snapshot.  Phase
+    numbers are allocated by write transactions (reports / graph swaps) and
+    backfilled by :func:`backfill_phases` when a legacy database is opened.
     """
     with read_tx() as conn:
-        revision, version, upstream = _load_graph(conn)
-        down: set[str] = {
-            r["service"]
-            for r in conn.execute("SELECT service FROM service_state WHERE status = 'down'")
-        }
-        seq_rows = {
-            r["service"]: r["last_seq"]
-            for r in conn.execute("SELECT service, last_seq FROM service_state")
-        }
+        snapshot = classify_snapshot(conn)
+        phases = phase_service.load_phases(conn)
 
-    down_here = {s for s in down if s in upstream}
-    roots = sorted(s for s in down_here if not any(u in down_here for u in upstream[s]))
+    for fault in snapshot["actionable_faults"]:
+        row = phases.get(fault["service"])
+        # A missing row can only mean a database written before phase tracking
+        # existed and not yet backfilled; expose it as an unacknowledged phase 0
+        # which no acknowledgement can match.
+        fault["phase"] = row["phase"] if row else 0
+        fault["acknowledged"] = bool(row and row["acknowledged_at"])
+        fault["acknowledged_at"] = row["acknowledged_at"] if row else None
 
-    # Memoized DFS over the DAG: roots reachable from a node through down nodes only.
-    memo: dict[str, list[str]] = {}
+    return snapshot
 
-    def reachable_roots(node: str) -> list[str]:
-        if node in memo:
-            return memo[node]
-        if node in roots:
-            memo[node] = [node]
-            return memo[node]
-        found: set[str] = set()
-        for up in upstream.get(node, []):
-            if up in down_here:
-                found.update(reachable_roots(up))
-        memo[node] = sorted(found)
-        return memo[node]
 
-    # All-all-down paths from a node up to a given root (for transparency).
-    def all_down_paths(node: str, root: str) -> list[list[str]]:
-        if node == root:
-            return [[node]]
-        paths: list[list[str]] = []
-        for up in upstream.get(node, []):
-            if up in down_here:
-                for tail in all_down_paths(up, root):
-                    paths.append([node] + tail)
-        return paths
+def backfill_phases() -> None:
+    """Initialise phase rows for a database committed before this feature.
 
-    actionable: list[dict] = []
-    suppressed: list[dict] = []
-    for svc in sorted(down_here):
-        # A root cause (faulty node with no faulty upstream) is always
-        # actionable; only non-root nodes can be suppressed.
-        if svc in roots:
-            actionable.append({"service": svc, "last_seq": seq_rows[svc]})
-            continue
-        svc_roots = reachable_roots(svc)
-        if svc_roots:
-            paths: list[list[str]] = []
-            for root in svc_roots:
-                paths.extend(all_down_paths(svc, root))
-            suppressed.append(
-                {
-                    "service": svc,
-                    "last_seq": seq_rows[svc],
-                    "root_causes": svc_roots,
-                    "paths": sorted(paths),
-                }
-            )
-        else:
-            actionable.append({"service": svc, "last_seq": seq_rows[svc]})
+    Safe to call on every startup: it only writes when classification says a
+    service is actionable but no phase row exists yet.  If no graph has been
+    committed there is nothing to do.
+    """
+    from .classification import actionable_services
+    from .errors import NoGraph
 
-    all_nodes = set(upstream)
-    unreported = sorted(all_nodes - set(seq_rows))
-    healthy = sorted(s for s in seq_rows if s in all_nodes and s not in down_here)
-
-    return {
-        "graph_revision": revision,
-        "graph_version": version,
-        "services": sorted(all_nodes),
-        "actionable_faults": actionable,
-        "suppressed_faults": suppressed,
-        "down_services": sorted(down_here),
-        "unreported_services": unreported,
-        "healthy_services": healthy,
-    }
+    try:
+        with write_tx() as conn:
+            phases = phase_service.load_phases(conn)
+            actionable = actionable_services(conn)
+            if any(svc not in phases for svc in actionable):
+                phase_service.sync_alert_phases(conn)
+    except NoGraph:
+        pass

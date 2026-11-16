@@ -59,6 +59,18 @@ CREATE TABLE IF NOT EXISTS events (
     applied         INTEGER NOT NULL,
     recorded_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- One row per service ever seen in the actionable set.  ``phase`` only ever
+-- increases; an acknowledgement is stored against exactly one phase.  Rows
+-- are kept when a service leaves the actionable set so phase numbers are
+-- never reused (a later episode always gets a fresh phase).
+CREATE TABLE IF NOT EXISTS alert_phase (
+    service         TEXT PRIMARY KEY,
+    phase           INTEGER NOT NULL CHECK (phase > 0),
+    actionable      INTEGER NOT NULL CHECK (actionable IN (0, 1)),
+    acknowledged_at TEXT,
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 _local = threading.local()
